@@ -1,133 +1,88 @@
 #!/usr/bin/env python
 
 import os
-import json
-import click
+import re
+import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import shelve
+import typing
+import json
 import hvac
 from hvac import exceptions
 
 
-'''
-This is a fast Vault secret key search program. This allows one to search
-through all keys in a Vault instance finding the paths It builds a local
-cache using shelve so you can search over and over without repeatitive api
-calls to your Vault instance.
-
-Be sure to export VAULT_ADDR and VAULT_TOKEN before using.
-'''
+# Local cache of Vault keys
+TEMP_VAULT_INDEX ='.tmp_vault_index.db'
+VAULT_INDEX = '.vault_index.db'
 
 
-def verify_vault_token():
-    """function to verify our token against Vault and ensure it is valid"""
-
-    assert client.lookup_token(os.environ.get('VAULT_TOKEN'))
-    click.echo("Confirmed vault token is valid")
-
-def recurse(key):
-
-    if key.endswith('/'):
-        result = client.list(path=key)
-        #print(json.dumps(result['data']['keys'], indent=4))
-        for x in result['data']['keys']:
-            if x.endswith('/'):
-                recurse(key+x)
-            else:
-                print(f'SECRET found at {x}')
-                path = key+x
-                print(f'Looking up secret at {path}')
-                result=client.read(path)
-                #print(json.dumps(result, indent=4))
-                secret=(json.dumps(result['data']))
-                s[path]=secret
-    else:
-        print(f'Looking up secret at {key}')
-        result = client.read(key)
-        #print(json.dumps(result, indent=4))
-        secret=(json.dumps(result['data']))
-        s[key]=secret
-
-def search(key):
-    print(f"Searching keys...")
-    if key.endswith('/'):
-        result = client.list(path=key)
-        #print(json.dumps(result['data']['keys'], indent=4))
-        for x in result['data']['keys']:
-            if x.endswith('/'):
-                recurse(key+x)
-            else:
-                print(f'SECRET found at {x}')
-                path = key+x
-                print(f'Looking up secret at {path}')
-                result=client.read(path)
-                #print(json.dumps(result, indent=4))
-                secret=(json.dumps(result['data']))
-                s[path]=secret
-    else:
-        print(f'Looking up secret at {key}')
-        result = client.read(key)
-        #print(json.dumps(result, indent=4))
-        secret=(json.dumps(result['data']))
-        s[key]=secret
+class Search():
+    """Background Indexer responsible for building and refreshing cache"""
 
 
-def backup_secrets():
+    def __init__(self):
+        self.client = hvac.Client()
+        self.index = shelve.open(TEMP_VAULT_INDEX,'c')
+        thread = threading.Thread(target=self.indexer, args=())
+        thread.daemon = False                # Daemonize thread
+        thread.start()
 
-    print(f"Backing up from {os.environ.get('VAULT_ADDR')}")
-    all_secrets = client.list(path='secret')
-    all_secret_keys = (all_secrets['data']['keys'])
-    for key in all_secret_keys:
-        recurse('secret/'+key)
+    def recurse(self, key):
+        if key.endswith('/'):
+            result = self.client.list(path=key)
+            for x in result['data']['keys']:
+                if x.endswith('/'):
+                    self.recurse(key+x)
+                else:
+                    path = key+x
+                    result = self.client.read(path)
+                    secret = (json.dumps(result['data']))
+                    self.index[path] = secret
+        else:
+            # this must be a secret
+            next
 
-    s.close()
+    def indexer(self):
+        # here we call Vault and index as a background task
+        print(f"Indexing secrets...")
+        all_secrets = self.client.list(path='secret')
+        all_secret_keys = (all_secrets['data']['keys'])
+        threads = []
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            for key in all_secret_keys:
+                threads.append(executor.submit(self.recurse, 'secret/'+key))
 
-def search_vault(search):
-    all_secrets = client.list(path='secret')
-    all_secret_keys = (all_secrets['data']['keys'])
-    for key in all_secret_keys:
-        search('secret/'+key)
-
-
-def read_secrets_from_shelve():
-    for key,value  in s.items():
-        print(f'{k}\t{v}')
-
-
-def write_secret_to_vault(k,v):
-
-    print(f'Restoring {k}')
-    result = client.write(k, **v)
-
-
-def restore_secrets():
-
-    for k,v in s.items():
-        val=json.loads(v)
-        write_secret_to_vault(k,val)
+        self.index.close()
+        os.rename(TEMP_VAULT_INDEX,VAULT_INDEX)
 
 
-@click.command()
-@click.option("-b", is_flag=True, help="backup Vault secrets to shelve")
-@click.option("-r", is_flag=True, help="restore Vault secrets to Vault instance")
-@click.option("--search", "-s", help="search Vault secrets for key")
-@click.option("-v", is_flag=True, help="verify token")
+    def search(self, search_term):
+        print(f"Searching for {search_term}...")
 
-def main(b,r,s,v):
-    """ Main Function """
+        try:
+            s = shelve.open(VAULT_INDEX,'r')
+            for k,v in s.items():
+                if search_term in k:
+                    print(f'Found {search_term} in {k}')
+        except:
+            # no locally cached db
+            print(f'Unable to locate the local cache file at {VAULT_INDEX}. Please allow indexing to complete')
 
-    if b:
-        click.echo("backup")
-        backup_secrets()
-    if r:
-        click.echo("restore")
-        restore_secrets()
-    if v:
-        verify_vault_token()
+def handler(self, signum):
+    exit(1)
 
-    if s:
-       search_vault(search)
+
+def main():
+    """ Main CLI """
+    key_search = Search()
+    signal.signal(signal.SIGINT, handler)
+    while True:
+        print(f'Press ctrl-c to exit')
+        print(f'Vault key to search for: ')
+        key_to_find = input()
+        key_search.search(key_to_find)
+
 
 if __name__=='__main__':
-    client = hvac.Client()
-    s = shelve.open("secrets_export.db")
     main()
